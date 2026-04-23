@@ -1,168 +1,164 @@
 # f0339
-BDBSF Organisation Geo Tagging
-# Organisation Geotagger
+# Extract Grants with Publications
 
-A Python script that adds geographic coordinates and location data to classified organisations, and generates an interactive HTML map colour-coded by classification. Uses an LLM to intelligently parse location information from messy affiliation strings.
+A Python script that reads a grants Excel file and a publications Excel file, filters the grants to only those that have at least one associated publication, and produces a clean `Grants.json` node file for the pipeline graph.
 
-## The problem
+No API calls required — pure Excel parsing.
 
-Many organisations in the pipeline have no ROR ID and no structured location data. Their only location clue is buried inside raw affiliation strings like:
+## Pipeline context
 
-- `"Black Dog Institute  Randwick New South Wales Australia"`
-- `"Monash Alfred Psychiatry Research Centre (MAPrc) The Alfred Hospital and Monash University Central Clinical School Melbourne Vic. Australia"`
+This script works alongside the author/publication pipeline rather than sitting in sequence after it. The publications Excel file is the same source used by [f0334](https://github.com/data-community-of-practice/f0334); f0339 uses it to identify which grants are in scope.
 
-These strings have no consistent delimiters — some use commas, some use double-spaces, some run everything together. A hardcoded list of cities and countries can't cover every case. Instead, this script uses Claude to parse them.
+```
+grants.xlsx  ─────────────────────────────┐
+                                          ├──  f0339  →  Grants.json
+publications.xlsx  (same file as f0334) ──┘
 
-## Location strategy
+publications.xlsx  →  f0334  →  ...  →  f0338  →  Researchers.json
+                                                    Researcher_Publication.json
+                                        f0337  →  Organisations.json
+                                                   Researcher_Organisation.json
+```
 
-The script tries four tiers in order, stopping when coordinates are found:
+Together `Grants.json`, `Researchers.json`, `Researcher_Publication.json`, `Organisations.json`, and `Researcher_Organisation.json` form the complete grant-researcher-publication graph.
 
-### Tier 1 — ROR API (most precise)
-For organisations with a ROR ID, fetches latitude, longitude, city, and country directly from the ROR record's GeoNames data.
+## How it works
 
-### Tier 2 — Nominatim by organisation name
-Geocodes the full organisation name (plus any known city/country) using the OpenStreetMap Nominatim API.
+1. Reads the `Grant_ID` column from the publications file to build the set of grant IDs that have at least one associated publication.
+2. Reads the grants file row by row, keeping only grants whose `Project Code` appears in that set.
+3. For each matching grant, extracts the title, start year, end year, and participant list (primary investigator + other investigators).
+4. If the same project code appears on multiple rows, participant lists are merged.
+5. Writes one JSON record per unique grant to `Grants.json`.
 
-### Tier 3 — LLM extraction from raw affiliations
-Sends each raw affiliation string to Claude (`temperature=0`) with a prompt that encodes affiliation-parsing knowledge: scan from the end, country is usually last, handle state abbreviations (VIC → Victoria, NSW → New South Wales, MD → Maryland), recognise that double-spaces act as delimiters, and that "England" means United Kingdom. Claude responds with structured JSON: `{"city": "Randwick", "state": "New South Wales", "country": "Australia"}`.
+## Output
 
-All LLM results are cached so re-runs are free and deterministic.
+One file: **`Grants.json`** — a JSON array of grant records.
 
-### Tier 4 — Nominatim by LLM-extracted location
-Geocodes whatever city/state/country the LLM extracted. Tries the org name + parsed location first, then just the location for at minimum a city-level pin.
+### Grant record
 
-**City and country are always populated from the best available source**, even when exact coordinates can't be determined.
+```json
+{
+  "grant_id": "12345678",
+  "title": "Understanding Neural Mechanisms of Anxiety",
+  "start_year": 2018,
+  "end_year": 2022,
+  "participant_list": [
+    "Jane Louise Doe",
+    "John M. Smith",
+    "Wei Zhang"
+  ]
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `grant_id` | The project code as read from the grants file. |
+| `title` | Grant title from the `TITLE` column. Empty string if not present. |
+| `start_year` | Four-digit year extracted from the `Start Date` column. `null` if not parseable. |
+| `end_year` | Four-digit year extracted from the `End Date` column. `null` if not parseable. |
+| `participant_list` | Ordered list of participant names. The primary investigator (`Preferred Full Name`) appears first, followed by names from `Other Investigators`. |
+
+## Input file formats
+
+### Grants file
+
+Must contain a `Project Code` column. All other columns are optional but used when present:
+
+| Column | Description |
+|--------|-------------|
+| `Project Code` | **Required.** Grant identifier — matched against `Grant_ID` in the publications file. |
+| `TITLE` | Grant title. |
+| `Start Date` | Grant start date. Accepts Excel date values or any string containing a four-digit year. |
+| `End Date` | Grant end date. Same format as `Start Date`. |
+| `Preferred Full Name` | Full name of the primary investigator. Added as the first participant. |
+| `Preferred First Name` | First name (read but not used separately in output). |
+| `Preferred Last Name` | Last name (read but not used separately in output). |
+| `Other Investigators` | Comma-separated list of additional investigator names. |
+
+### Publications file
+
+Must contain a `Grant_ID` column. This is the same file used as input to f0334 — no preparation needed beyond what f0334 already requires.
+
+| Column | Description |
+|--------|-------------|
+| `Grant_ID` | **Required.** Used to identify which grants have publications. All other columns are ignored. |
 
 ## Requirements
 
 - Python 3.7+
-- Libraries: `openpyxl`, `requests`
-- An Anthropic API key (for Tier 3 LLM extraction — optional but recommended)
+- Library: `openpyxl`
 
 ```bash
-pip install openpyxl requests
+pip install openpyxl
 ```
-
-## Setup
-
-Uses the same `config.ini` as the other scripts:
-
-```ini
-[crossref]
-email = yourname@example.com
-delay = 1
-save_every = 50
-max_retries = 3
-
-[anthropic]
-api_key = sk-ant-your-key-here
-```
-
-Without an API key, Tiers 1 and 2 still run but Tier 3 (LLM parsing) is skipped, which means organisations without ROR IDs or Nominatim matches will likely have no location data.
-
-## Input file format
-
-The script expects the output of `classify_orgs.py` with at minimum:
-
-| Column | Required | Description |
-|---|---|---|
-| `Organisation_Name` | Yes | Canonical institution name |
-| `ROR_ID` | No | Used for Tier 1 geocoding |
-| `Country`, `City` | No | Used as context for Nominatim |
-| `Raw_Variants` | No | Raw affiliation strings — parsed by LLM for location |
-| `Classification` | No | Used for map colour coding |
 
 ## Usage
 
-### From a terminal
+Both input files are required positional arguments:
 
 ```bash
-python geotag_orgs.py classified_orgs.xlsx
+python f0339.py grants.xlsx publications.xlsx
 ```
 
-### From Spyder
+Specify a custom output path:
+
+```bash
+python f0339.py grants.xlsx publications.xlsx --output path/to/Grants.json
+```
+
+By default the output is written to `Grants.json` in the same directory as the grants file.
+
+### From Spyder or Jupyter
 
 ```python
-!python "E:\your\folder\geotag_orgs.py" "E:\your\folder\classified_orgs.xlsx"
+!python "E:\your\folder\f0339.py" "E:\your\folder\grants.xlsx" "E:\your\folder\publications.xlsx"
 ```
 
-## Output
-
-### 1. Excel file (`<input>_geotagged.xlsx`)
-
-| Column | Description |
-|---|---|
-| `Latitude` | Geographic latitude |
-| `Longitude` | Geographic longitude |
-| `City` | City name — enriched from ROR, Nominatim, or LLM parsing |
-| `Country` | Country name — enriched from best available source |
-| `Geo_Source` | Where coordinates came from: `ROR`, `Nominatim`, `Nominatim (LLM-parsed)`, `Nominatim (city)`, or error |
-
-Plus all columns from the classified organisations file.
-
-### 2. Interactive HTML map (`<input>_geotagged_map.html`)
-
-A standalone Leaflet.js map with colour-coded pins:
-
-| Colour | Classification |
-|---|---|
-| Blue | Research |
-| Purple | Health |
-| Green | Government |
-| Red | Industry |
-| Orange | Unclassified |
-
-Click any pin for details. A "Not mapped" panel lists organisations that have city/country but couldn't be geocoded.
-
-## Cache files
-
-| File | Purpose |
-|---|---|
-| `<input>_geo_cache.json` | Coordinates and location for each organisation |
-| `<input>_llm_location_cache.json` | LLM-extracted city/state/country from raw affiliation strings |
-
-Re-running skips cached results. Delete a cache file to force re-processing for that tier.
-
-## Full pipeline
-
-This is step 6:
+## Console output
 
 ```
-1. python crossref_author_fetch.py <input>.xlsx
-     → adds Crossref_Authors column
+Grants:       /path/to/grants.xlsx
+Publications: /path/to/publications.xlsx
+Output:       /path/to/Grants.json
 
-2. python extract_unique_authors.py <step1_output>.xlsx
-     → one row per unique author with DOIs
+Grant IDs in publications file: 387
 
-3. python fetch_affiliations.py <step2_output>.xlsx
-     → adds Affiliations column (Crossref + OpenAlex)
+=======================================================
+GRANT EXTRACTION SUMMARY
+=======================================================
+Grants with publications:  387
+Total participants:        1243
 
-4. python extract_unique_orgs.py <step3_output>.xlsx
-     → one row per unique institution with ROR ID
+  12345678: Understanding Neural Mechanisms of Anxiety
+    Years: 2018 - 2022
+    Participants: Jane Louise Doe, John M. Smith, Wei Zhang
 
-5. python classify_orgs.py <step4_output>.xlsx
-     → adds Classification (Research/Health/Government/Industry)
+  87654321: Depression in Adolescent Populations
+    Years: 2019 - 2023
+    Participants: Alex Brown, Sarah Connor
 
-6. python geotag_orgs.py <step5_output>.xlsx
-     → adds coordinates + city/country + generates interactive map
+  ... and 382 more
+
+Saved: /path/to/Grants.json
 ```
 
 ## Troubleshooting
 
 | Problem | Solution |
-|---|---|
-| LLM tier skipped | Add your Anthropic API key to `config.ini` under `[anthropic]`. |
-| Orgs still missing location | The raw affiliation strings may contain no location info at all (e.g., just a department name). These are listed in the map's "Not mapped" panel. |
-| `403` from Nominatim | Set a real email in config.ini. Nominatim blocks requests without a proper User-Agent. |
-| Wrong coordinates | Check `Geo_Source`. `Nominatim (city)` means it geocoded the city, not the institution. ROR is most precise. |
-| Old cache causing issues | Delete `_geo_cache.json` and/or `_llm_location_cache.json` and re-run. |
+|---------|----------|
+| `ERROR: No 'Grant_ID' column in publications file` | The publications file must have a column named exactly `Grant_ID`. This is the same column required by f0334. |
+| `ERROR: No 'Project Code' column in grants file` | The grants file must have a column named exactly `Project Code`. The error message lists what columns were found. |
+| `start_year` or `end_year` is `null` | The date column either had no value or a format the script could not find a four-digit year in. Check the raw cell value in Excel. |
+| Participants missing from a grant | Only `Preferred Full Name` and `Other Investigators` are used. Ensure those column names match exactly, including capitalisation. |
+| Fewer grants than expected | Only grants whose `Project Code` appears at least once in the `Grant_ID` column of the publications file are included. Grants with no associated publications are filtered out by design. |
 
 ## Limitations
 
-- **Nominatim rate limit**: Max 1 request/second on the public API. Large datasets may take time.
-- **LLM parsing accuracy**: Claude handles the vast majority of affiliation formats correctly, but unusual or non-English affiliations may occasionally be misparsed. Results are cached so you can inspect `_llm_location_cache.json` to audit.
-- **Offline map viewing**: The HTML map requires an internet connection to load map tiles. The marker data is embedded in the file.
+- **Column name sensitivity**: all column name matching is exact (case and spacing must match the values listed above).
+- **Other Investigators parsing**: the `Other Investigators` column is split on commas. Names that contain commas (rare but possible) will be split incorrectly.
+- **Year extraction only**: full dates are not preserved — only the four-digit year is extracted from `Start Date` and `End Date`.
+- **First active sheet only**: the script reads the first (active) worksheet in each Excel file. Data on other sheets is ignored.
 
 ## License
 
-This script is provided as-is for research and data management purposes. Map data from OpenStreetMap (ODbL license).
+This script is provided as-is for research and data management purposes.
